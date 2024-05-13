@@ -1,0 +1,337 @@
+From 307b4597f5d7b8692aa57e0a2d08a24f9c167310 Mon Sep 17 00:00:00 2001
+From: Lei Chen <ls.cat@outlook.com>
+Date: Sat, 26 Nov 2022 20:06:30 +0800
+Subject: [PATCH 3/4] feat-wip: redis robj with atlas runtime finish
+
+---
+ src/atlas.h    |  17 +++++
+ src/db.c       | 173 +++++++++++++++++++++++++++++++++++++++++++++----
+ src/object.c   |   4 +-
+ src/server.h   |   4 ++
+ src/t_string.c |   9 ++-
+ 5 files changed, 192 insertions(+), 15 deletions(-)
+ create mode 100644 src/atlas.h
+
+diff --git a/src/atlas.h b/src/atlas.h
+new file mode 100644
+index 000000000..178053125
+--- /dev/null
++++ b/src/atlas.h
+@@ -0,0 +1,17 @@
++#pragma once
++#include <runtime.h>
++#include <pointer_shim.h>
++#include <bks_types.h>
++
++extern void *global_psf;
++
++/* [Atlas] as the orig object ptr is 0x7fxxxxx, the most siginificant bit of our unique ptr metadata must be 1 */
++static inline bool is_atlas_ptr(void *ptr)
++{
++    return (uintptr_t)ptr >> 63;
++}
++
++static inline void atlas_init(void){
++    runtime_init();
++    memset(global_psf, 0xf, BKS_PSF_MMAP_SIZE);
++}
+\ No newline at end of file
+diff --git a/src/db.c b/src/db.c
+index 75490d777..99ef8503f 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -137,6 +137,65 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
+     return val;
+ }
+ 
++/*
++ * Similar to lookupKey, but return the entry if the val is an atlas object to release the raw ptr later.
++ */
++robj *atlasLookupKeyGet(redisDb *db, robj *key, int flags, atlas_unique_ptr_wh** up) {
++    dictEntry *de = dictFind(db->dict,key->ptr);
++    robj *val = NULL;
++    if (de) {
++        val = dictGetVal(de);
++        if(is_atlas_ptr(val)){
++            *up = (atlas_unique_ptr*)&(de->v.val);
++            val = atlas_up_deref_get(*up);
++            serverLog(LL_NOTICE,"atlas found key 0x%lx, %p\n", (*up)->handle,(void*)val);
++        }
++        /* Forcing deletion of expired keys on a replica makes the replica
++         * inconsistent with the master. We forbid it on readonly replicas, but
++         * we have to allow it on writable replicas to make write commands
++         * behave consistently.
++         *
++         * It's possible that the WRITE flag is set even during a readonly
++         * command, since the command may trigger events that cause modules to
++         * perform additional writes. */
++        int is_ro_replica = server.masterhost && server.repl_slave_ro;
++        int expire_flags = 0;
++        if (flags & LOOKUP_WRITE && !is_ro_replica)
++            expire_flags |= EXPIRE_FORCE_DELETE_EXPIRED;
++        if (flags & LOOKUP_NOEXPIRE)
++            expire_flags |= EXPIRE_AVOID_DELETE_EXPIRED;
++        if (expireIfNeeded(db, key, expire_flags)) {
++            /* The key is no longer valid. */
++            val = NULL;
++        }
++    }
++
++    if (val) {
++        /* Update the access time for the ageing algorithm.
++         * Don't do it if we have a saving child, as this will trigger
++         * a copy on write madness. */
++        if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)){
++            if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
++                updateLFU(val);
++            } else {
++                val->lru = LRU_CLOCK();
++            }
++        }
++
++        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
++            server.stat_keyspace_hits++;
++        /* TODO: Use separate hits stats for WRITE */
++        // serverLog(LL_NOTICE,"get val refcnt %d\n", val->refcount); 
++    } else {
++        if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE)))
++            notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
++        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
++            server.stat_keyspace_misses++;
++        /* TODO: Use separate misses stats and notify event for WRITE */
++    }
++    return val;
++}
++
+ /* Lookup a key for read operations, or return NULL if the key is not found
+  * in the specified DB.
+  *
+@@ -177,6 +236,23 @@ robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
+     return o;
+ }
+ 
++/* Return if the key is in the db */
++bool atlasLookupKeyWrite(redisDb *db, robj *key){
++    dictEntry *de = dictFind(db->dict,key->ptr);
++    robj *val = NULL;
++    if (de) {
++        val = dictGetVal(de);
++    }
++
++    return val != NULL;
++}
++
++robj *atlasLookupKeyReadGetOrReply(client *c, robj *key, robj *reply,atlas_unique_ptr_wh **up) {
++    robj *o = atlasLookupKeyGet(c->db, key, LOOKUP_NONE, up);
++    if (!o) addReplyOrErrorObject(c, reply);
++    return o;
++}
++
+ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
+     robj *o = lookupKeyWrite(c->db, key);
+     if (!o) addReplyOrErrorObject(c, reply);
+@@ -192,15 +268,32 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
+     dictEntry *de = dictAddRaw(db->dict, copy, NULL);
+     serverAssertWithInfo(NULL, key, de != NULL);
+     dictSetVal(db->dict, de, val);
+-    // if((db->dict)->type->valDup)
+-    //     serverLog(LL_NOTICE,"val dup\n");
+-    // else
+-    //     serverLog(LL_NOTICE,"no val dup\n");
+     signalKeyAsReady(db, key, val->type);
+     if (server.cluster_enabled) slotToKeyAddEntry(de, db);
+     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
+ }
+ 
++robj *atlasDbAddGet(redisDb *db, robj *key, robj *val, atlas_unique_ptr ** up) {
++    sds copy = sdsdup(key->ptr);
++    dictEntry *de = dictAddRaw(db->dict, copy, NULL);
++    serverAssertWithInfo(NULL, key, de != NULL);
++    if(val->type == OBJ_STRING){
++        serverLog(LL_NOTICE,"dbAdd , val %p\n", (void*)val);
++        dictSetVal(db->dict, de, (robj*)atlas_make_unique_ptr(val, sizeof(robj)).handle);
++        // *up = (atlas_unique_ptr*)&de->v.val;
++        // val = atlas_up_deref_get(*up);
++    }else{
++        serverLog(LL_WARNING,"dbAdd non-string object\n");
++        dictSetVal(db->dict, de, val);
++        signalKeyAsReady(db, key, val->type);
++        if (server.cluster_enabled) slotToKeyAddEntry(de, db);
++    }
++    notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
++
++    return val;
++}
++
++
+ /* This is a special version of dbAdd() that is used only when loading
+  * keys from the RDB file: the key is passed as an SDS string that is
+  * retained by the function (and not freed by the caller).
+@@ -251,6 +344,49 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
+     dictFreeVal(db->dict, &auxentry);
+ }
+ 
++robj* atlasDbOverwriteGet(redisDb *db, robj *key, robj *val, atlas_unique_ptr ** up) {
++    dictEntry *de = dictFind(db->dict,key->ptr);
++
++    serverAssertWithInfo(NULL,key,de != NULL);
++    dictEntry auxentry = *de;
++    robj *old = dictGetVal(de);
++    bool old_is_altas = false;
++    *up = (atlas_unique_ptr*)&de->v.val;
++
++    if(is_atlas_ptr(old)){
++        bool is_evicted = false;
++        old = atlas_up_deref_get_evicted(*up, &is_evicted);
++        atlas_up_deref_put(*up, old);
++        if(is_evicted){
++            old->type = OBJ_ATLAS_EVICT_STRING;
++            serverLog(LL_NOTICE,"atlas evicted robj %p\n", old);
++        }
++        auxentry.v.val = old;
++    }
++
++    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
++        val->lru = old->lru;
++    }
++    /* Although the key is not really deleted from the database, we regard 
++     * overwrite as two steps of unlink+add, so we still need to call the unlink
++     * callback of the module. */
++    moduleNotifyKeyUnlink(key,old,db->id);
++    /* We want to try to unblock any client using a blocking XREADGROUP */
++    if (old->type == OBJ_STREAM)
++        signalKeyAsReady(db,key,old->type);
++
++    dictSetVal(db->dict, de, (robj*)atlas_make_unique_ptr(val, sizeof(robj)).handle);
++    // val = atlas_up_deref_get(*up);
++
++    if (server.lazyfree_lazy_server_del) {
++        freeObjAsync(key,old,db->id);
++        dictSetVal(db->dict, &auxentry, NULL);
++    }
++
++    dictFreeVal(db->dict, &auxentry);
++    return val;
++}
++
+ /* High level Set operation. This function can be used in order to set
+  * a key, whatever it was existing or not, to a new object.
+  *
+@@ -269,20 +405,33 @@ void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
+     // atlas_unique_ptr up = atlas_make_unique_ptr(val, 1);
+     // serverLog(LL_NOTICE,"SET KEY, flag & exist %d, doenot %d, up handle %lx\n",
+     //     flags & SETKEY_ALREADY_EXIST, !(flags & SETKEY_DOESNT_EXIST), up.handle);
+-
++    bool str_val = val->type == OBJ_STRING;
++    atlas_unique_ptr *up = NULL; 
+     if (flags & SETKEY_ALREADY_EXIST)
+         keyfound = 1;
+     else if (!(flags & SETKEY_DOESNT_EXIST))
+-        keyfound = (lookupKeyWrite(db,key) != NULL);
+-
+-    if (!keyfound) {
+-        dbAdd(db,key,val);
+-    } else {
+-        dbOverwrite(db,key,val);
+-    }
++        keyfound = str_val ? atlasLookupKeyWrite(db, key):
++                            (lookupKeyWrite(db,key) != NULL);
++        // keyfound = (lookupKeyWrite(db,key) != NULL);
+     incrRefCount(val);
++    if(str_val){
++        if (!keyfound) {
++            val = atlasDbAddGet(db,key,val, &up);
++        } else {
++            val = atlasDbOverwriteGet(db,key,val,&up);
++        }
++    }else{
++        if (!keyfound) {
++            dbAdd(db,key,val);
++        } else {
++            dbOverwrite(db,key,val);
++        }
++    }
+     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db,key);
+     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c,db,key);
++    // if(str_val && up != NULL){
++    //     atlas_up_deref_put(up, val);
++    // }
+ }
+ 
+ /* Return a random key, in form of a Redis object.
+diff --git a/src/object.c b/src/object.c
+index ad3891dc9..964331d38 100644
+--- a/src/object.c
++++ b/src/object.c
+@@ -382,9 +382,11 @@ void decrRefCount(robj *o) {
+         case OBJ_HASH: freeHashObject(o); break;
+         case OBJ_MODULE: freeModuleObject(o); break;
+         case OBJ_STREAM: freeStreamObject(o); break;
++        case OBJ_ATLAS_EVICT_STRING: freeStringObject(o); break;
+         default: serverPanic("Unknown object type"); break;
+         }
+-        zfree(o);
++        if(o->type != OBJ_ATLAS_EVICT_STRING)
++            zfree(o);
+     } else {
+         if (o->refcount <= 0) serverPanic("decrRefCount against refcount <= 0");
+         if (o->refcount != OBJ_SHARED_REFCOUNT) o->refcount--;
+diff --git a/src/server.h b/src/server.h
+index da5951357..614c816c7 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -659,6 +659,8 @@ typedef enum {
+ #define OBJ_MODULE 5    /* Module object. */
+ #define OBJ_STREAM 6    /* Stream object. */
+ 
++#define OBJ_ATLAS_EVICT_STRING 7 /* Atlas string object which has been evicted */
++
+ /* Extract encver / signature from a module type ID. */
+ #define REDISMODULE_TYPE_ENCVER_BITS 10
+ #define REDISMODULE_TYPE_ENCVER_MASK ((1<<REDISMODULE_TYPE_ENCVER_BITS)-1)
+@@ -3089,6 +3091,8 @@ int checkAlreadyExpired(long long when);
+ robj *lookupKeyRead(redisDb *db, robj *key);
+ robj *lookupKeyWrite(redisDb *db, robj *key);
+ robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
++struct atlas_unique_ptr_wh;
++robj *atlasLookupKeyReadGetOrReply(client *c, robj *key, robj *reply, struct atlas_unique_ptr_wh**up);
+ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply);
+ robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags);
+ robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags);
+diff --git a/src/t_string.c b/src/t_string.c
+index 4aeb7d8d5..bf43a4291 100644
+--- a/src/t_string.c
++++ b/src/t_string.c
+@@ -89,7 +89,8 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
+         if (getGenericCommand(c) == C_ERR) return;
+     }
+ 
+-    found = (lookupKeyWrite(c->db,key) != NULL);
++    // found = (lookupKeyWrite(c->db,key) != NULL);
++    found = atlasLookupKeyWrite(c->db, key);
+ 
+     if ((flags & OBJ_SET_NX && found) ||
+         (flags & OBJ_SET_XX && !found))
+@@ -324,7 +325,8 @@ void psetexCommand(client *c) {
+ int getGenericCommand(client *c) {
+     robj *o;
+ 
+-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == NULL)
++    atlas_unique_ptr_wh *up = NULL;
++    if ((o = atlasLookupKeyReadGetOrReply(c,c->argv[1],shared.null[c->resp], &up)) == NULL)
+         return C_OK;
+ 
+     if (checkType(c,o,OBJ_STRING)) {
+@@ -333,6 +335,9 @@ int getGenericCommand(client *c) {
+ 
+     // serverLog(LL_NOTICE,"atlas obj encoding %d\n", o->encoding);
+     addReplyBulk(c,o);
++    if(up){
++        atlas_up_deref_put(up, o);
++    }
+     return C_OK;
+ }
+ 
+-- 
+2.25.1
+

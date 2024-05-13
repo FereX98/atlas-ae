@@ -1,0 +1,39 @@
+From 973d0d435c29c5b5bfcc1f36f7de0cc42914a0e1 Mon Sep 17 00:00:00 2001
+From: Lei Chen <ls.cat@outlook.com>
+Date: Mon, 5 Dec 2022 21:41:29 +0800
+Subject: [PATCH 2/2] feat: use jemalloc
+
+---
+ Makefile.am | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile.am b/Makefile.am
+index 2910b46..0927f3a 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -81,11 +81,21 @@ memcached_CPPFLAGS = -DNDEBUG
+ memcached_debug_LDADD = @PROFILER_LDFLAGS@
+ memcached_debug_CFLAGS = @PROFILER_FLAGS@
+ 
+-memcached_LDADD =
++ATLAS_PATH = /ssd/chenlei/atlas/Paris
++JEMALLOC_DIR = $(ATLAS_PATH)/third_party/jemalloc
++ATLAS_INC = -I$(JEMALLOC_DIR)/include
++ATLAS_LIB = -L$(JEMALLOC_DIR)/lib -Wl,-rpath=$(JEMALLOC_DIR)/lib
++
++memcached_LDADD = 
+ memcached_DEPENDENCIES =
+ memcached_debug_DEPENDENCIES =
+ CLEANFILES=
+ 
++memcached_CFLAGS = ${ATLAS_INC} ${ATLAS_LIB}
++memcached_LDADD += -ljemalloc
++memcached_debug_CFLAGS += ${ATLAS_INC} ${ATLAS_LIB}
++memcached_debug_LDADD += -ljemalloc
++
+ if BUILD_LINUX_PRIVS
+ memcached_LDADD += -lseccomp
+ memcached_debug_LDADD += -lseccomp
+-- 
+2.25.1
+

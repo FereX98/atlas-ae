@@ -1,0 +1,562 @@
+From 2624583f0309a9179598f31d577bd8441c5b2bed Mon Sep 17 00:00:00 2001
+From: Lei Chen <ls.cat@outlook.com>
+Date: Mon, 5 Dec 2022 08:54:06 +0800
+Subject: [PATCH] feat: atlas runtime for triangle-count
+
+---
+ Makefile           |  12 +++-
+ src/builder.h      |  12 +++-
+ src/command_line.h |   6 +-
+ src/graph.h        | 176 +++++++++++++++++++++++++++++++++++++++++----
+ src/reader.h       |  28 ++++++--
+ src/tc.cc          |  66 +++++++++++++++--
+ 6 files changed, 270 insertions(+), 30 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 5bd07e4..7f78409 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,14 @@
+ # See LICENSE.txt for license details.
+ 
+-CXX_FLAGS += -std=c++11 -O3 -Wall
++ATLAS_PATH = /ssd/chenlei/atlas/Paris
++ifeq ("$(wildcard $(ATLAS_PATH)/build/runtime/lib/libparis.so)","")
++$(error "$(ATLAS_PATH)/build/runtime/lib/libparis.so" does not exist, please build atlas runtime and set the correct path)
++endif
++
++ATLAS_INC = -I$(ATLAS_PATH)/runtime/include -I$(ATLAS_PATH)/bks_module/include
++ATLAS_LIB = -L$(ATLAS_PATH)/build/runtime/lib -Wl,-rpath=$(ATLAS_PATH)/build/runtime/lib -lparis
++
++CXX_FLAGS += -std=c++11 -O3 -Wall $(ATLAS_INC)
+ PAR_FLAG = -fopenmp
+ 
+ ifneq (,$(findstring icpc,$(CXX)))
+@@ -23,7 +31,7 @@ SUITE = $(KERNELS) converter
+ all: $(SUITE)
+ 
+ % : src/%.cc src/*.h
+-	$(CXX) $(CXX_FLAGS) $< -o $@
++	$(CXX) $(CXX_FLAGS) $< $(ATLAS_LIB) -o $@
+ 
+ # Testing
+ include test/test.mk
+diff --git a/src/builder.h b/src/builder.h
+index e74a06e..2ecafd0 100644
+--- a/src/builder.h
++++ b/src/builder.h
+@@ -339,14 +339,14 @@ class BuilderBase {
+                                                 inv_index, inv_neighs);
+   }
+ 
+-  CSRGraph<NodeID_, DestID_, invert> MakeGraph() {
++  CSRGraph<NodeID_, DestID_, invert> MakeGraph(bool atlas = false) {
+     CSRGraph<NodeID_, DestID_, invert> g;
+     {  // extra scope to trigger earlier deletion of el (save memory)
+       EdgeList el;
+       if (cli_.filename() != "") {
+         Reader<NodeID_, DestID_, WeightT_, invert> r(cli_.filename());
+         if ((r.GetSuffix() == ".sg") || (r.GetSuffix() == ".wsg")) {
+-          return r.ReadSerializedGraph();
++          return r.ReadSerializedGraph(atlas);
+         } else {
+           el = r.ReadFile(needs_weights_);
+         }
+@@ -389,15 +389,21 @@ class BuilderBase {
+     pvector<SGOffset> offsets = ParallelPrefixSum(degrees);
+     DestID_* neighs = new DestID_[offsets[g.num_nodes()]];
+     DestID_** index = CSRGraph<NodeID_, DestID_>::GenIndex(offsets, neighs);
++    atlas::AtlasUniquePtr<DestID_>* atlas_index = nullptr;
++    unsigned *nsize = nullptr;
+     #pragma omp parallel for
+     for (NodeID_ u=0; u < g.num_nodes(); u++) {
+       for (NodeID_ v : g.out_neigh(u))
+         neighs[offsets[new_ids[u]]++] = new_ids[v];
+       std::sort(index[new_ids[u]], index[new_ids[u]+1]);
+     }
++    if(g.enable_atlas()) {
++      atlas_index = CSRGraph<NodeID_, DestID_>::AtlasFromIndex((const DestID_**)index, offsets.size());
++      nsize = CSRGraph<NodeID_, DestID_>::AtlasGenSize(offsets, neighs);
++    }
+     t.Stop();
+     PrintTime("Relabel", t.Seconds());
+-    return CSRGraph<NodeID_, DestID_, invert>(g.num_nodes(), index, neighs);
++    return CSRGraph<NodeID_, DestID_, invert>(g.num_nodes(), index, neighs, atlas_index, nsize);
+   }
+ };
+ 
+diff --git a/src/command_line.h b/src/command_line.h
+index 78de281..23e47c4 100644
+--- a/src/command_line.h
++++ b/src/command_line.h
+@@ -116,14 +116,16 @@ class CLApp : public CLBase {
+   int num_trials_ = 16;
+   int64_t start_vertex_ = -1;
+   bool do_verify_ = false;
++  bool atlas_ = false;
+ 
+  public:
+   CLApp(int argc, char** argv, std::string name) : CLBase(argc, argv, name) {
+-    get_args_ += "an:r:v";
++    get_args_ += "an:r:v:x";
+     AddHelpLine('a', "", "output analysis of last run", "false");
+     AddHelpLine('n', "n", "perform n trials", std::to_string(num_trials_));
+     AddHelpLine('r', "node", "start from node r", "rand");
+     AddHelpLine('v', "", "verify the output of each run", "false");
++    AddHelpLine('x', "", "enable atlas runtime", "false");
+   }
+ 
+   void HandleArg(signed char opt, char* opt_arg) override {
+@@ -132,6 +134,7 @@ class CLApp : public CLBase {
+       case 'n': num_trials_ = atoi(opt_arg);            break;
+       case 'r': start_vertex_ = atol(opt_arg);          break;
+       case 'v': do_verify_ = true;                      break;
++      case 'x': atlas_ = true;                      break;
+       default: CLBase::HandleArg(opt, opt_arg);
+     }
+   }
+@@ -140,6 +143,7 @@ class CLApp : public CLBase {
+   int num_trials() const { return num_trials_; }
+   int64_t start_vertex() const { return start_vertex_; }
+   bool do_verify() const { return do_verify_; }
++  bool enable_atlas() const { return atlas_; }
+ };
+ 
+ 
+diff --git a/src/graph.h b/src/graph.h
+index 7af29dc..3c3e0e8 100644
+--- a/src/graph.h
++++ b/src/graph.h
+@@ -9,6 +9,8 @@
+ #include <cstddef>
+ #include <iostream>
+ #include <type_traits>
++#include <pointer.h>
++#include <runtime.h>
+ 
+ #include "pvector.h"
+ #include "util.h"
+@@ -116,50 +118,116 @@ class CSRGraph {
+     iterator end()   { return g_index_[n_+1]; }
+   };
+ 
+-  void ReleaseResources() {
+-    if (out_index_ != nullptr)
+-      delete[] out_index_;
+-    if (out_neighbors_ != nullptr)
+-      delete[] out_neighbors_;
+-    if (directed_) {
+-      if (in_index_ != nullptr)
+-        delete[] in_index_;
+-      if (in_neighbors_ != nullptr)
+-        delete[] in_neighbors_;
++  class AtlasNeighborhood {
++    NodeID_ n_;
++    unsigned *nsize_;
++    atlas::AtlasUniquePtr<DestID_>* atlas_index_;
++    OffsetT start_offset_;
++    OffsetT max_offset_;
++    DestID_* ptr_;
++    const bool raw_ = true;
++    const bool need_put_ = false;
++   public:
++    OffsetT size() { return max_offset_ - start_offset_; }
++    AtlasNeighborhood(NodeID_ n, unsigned * nsize, atlas::AtlasUniquePtr<DestID_>* atlas_index, OffsetT start_offset, unsigned raw_offset) :
++        n_(n), nsize_(nsize), atlas_index_(atlas_index), start_offset_(0), 
++        max_offset_(0), ptr_(nullptr) {
++      max_offset_ = atlas_index_[n_].get_size() / sizeof(DestID_);
++      if(max_offset_ == 0)
++          max_offset_ = nsize_[n_];
++      start_offset_ = std::min(start_offset, max_offset_);
++
++      /* raw api */
++      if(raw_)
++        ptr_ = atlas_index_[n_].deref_raw(raw_offset) + start_offset_;
++      else
++        ptr_ = atlas_index_[n_].deref_no_scope() + start_offset_;
+     }
+-  }
++    typedef DestID_* iterator;
++    iterator begin() { 
++        return ptr_;  
++      }
++    iterator end()   { 
++      return ptr_ + max_offset_; 
++    }
++    ~AtlasNeighborhood(){
++      if(need_put_ && ptr_){
++        atlas_index_[n_].deref_put(ptr_);
++      }
++    }
++  };
+ 
+ 
+  public:
+   CSRGraph() : directed_(false), num_nodes_(-1), num_edges_(-1),
+     out_index_(nullptr), out_neighbors_(nullptr),
+-    in_index_(nullptr), in_neighbors_(nullptr) {}
++    in_index_(nullptr), in_neighbors_(nullptr), atlas_in_index_(nullptr), 
++    atlas_out_index_(nullptr), atlas_in_nsize_(nullptr), atlas_out_nsize_(nullptr) {}
+ 
+   CSRGraph(int64_t num_nodes, DestID_** index, DestID_* neighs) :
+     directed_(false), num_nodes_(num_nodes),
+     out_index_(index), out_neighbors_(neighs),
+-    in_index_(index), in_neighbors_(neighs) {
++    in_index_(index), in_neighbors_(neighs), atlas_in_index_(nullptr), 
++    atlas_out_index_(nullptr), atlas_in_nsize_(nullptr), atlas_out_nsize_(nullptr){
+       num_edges_ = (out_index_[num_nodes_] - out_index_[0]) / 2;
++      printf("normal num nodes %ld\n", num_nodes_);
+     }
+ 
+   CSRGraph(int64_t num_nodes, DestID_** out_index, DestID_* out_neighs,
+         DestID_** in_index, DestID_* in_neighs) :
+     directed_(true), num_nodes_(num_nodes),
+     out_index_(out_index), out_neighbors_(out_neighs),
+-    in_index_(in_index), in_neighbors_(in_neighs) {
++    in_index_(in_index), in_neighbors_(in_neighs), atlas_in_index_(nullptr), 
++    atlas_out_index_(nullptr), atlas_in_nsize_(nullptr), atlas_out_nsize_(nullptr){
++      num_edges_ = out_index_[num_nodes_] - out_index_[0];
++    }
++
++  CSRGraph(int64_t num_nodes, DestID_** index, DestID_* neighs, 
++    atlas::AtlasUniquePtr<DestID_>* atlas_index, unsigned * atlas_nsize) :
++    directed_(false), num_nodes_(num_nodes),
++    out_index_(index), out_neighbors_(neighs),
++    in_index_(index), in_neighbors_(neighs), atlas_in_index_(atlas_index), 
++    atlas_out_index_(atlas_index),atlas_in_nsize_(atlas_nsize), atlas_out_nsize_(atlas_nsize)  {
++      num_edges_ = (out_index_[num_nodes_] - out_index_[0]) / 2;
++      // BARRIER_ASSERT(atlas_nsize != nullptr);
++      printf("atlas !\n");
++      // delete[] out_index_;
++      // out_index_ = nullptr;
++      // in_index_ = nullptr;
++    }
++
++  CSRGraph(int64_t num_nodes, DestID_** out_index, DestID_* out_neighs,
++        DestID_** in_index, DestID_* in_neighs, atlas::AtlasUniquePtr<DestID_>* atlas_out_index,
++        atlas::AtlasUniquePtr<DestID_>* atlas_in_index, unsigned * atlas_out_nsize, unsigned * atlas_in_nsize) :
++    directed_(true), num_nodes_(num_nodes),
++    out_index_(out_index), out_neighbors_(out_neighs),
++    in_index_(in_index), in_neighbors_(in_neighs), atlas_in_index_(atlas_in_index), 
++    atlas_out_index_(atlas_out_index), atlas_in_nsize_(atlas_in_nsize), atlas_out_nsize_(atlas_out_nsize) {
+       num_edges_ = out_index_[num_nodes_] - out_index_[0];
++      // // BARRIER_ASSERT(atlas_in_nsize != nullptr && atlas_out_nsize != nullptr);
++      // delete [] out_index_;
++      // delete [] in_index_;
++      // out_index_ = nullptr;
++      // in_index_ = nullptr;
+     }
+ 
+   CSRGraph(CSRGraph&& other) : directed_(other.directed_),
+     num_nodes_(other.num_nodes_), num_edges_(other.num_edges_),
+     out_index_(other.out_index_), out_neighbors_(other.out_neighbors_),
+-    in_index_(other.in_index_), in_neighbors_(other.in_neighbors_) {
++    in_index_(other.in_index_), in_neighbors_(other.in_neighbors_),
++    atlas_in_index_(other.atlas_in_index_), atlas_out_index_(other.atlas_out_index_),
++    atlas_in_nsize_(other.atlas_in_nsize_), atlas_out_nsize_(other.atlas_out_nsize_) {
+       other.num_edges_ = -1;
+       other.num_nodes_ = -1;
+       other.out_index_ = nullptr;
+       other.out_neighbors_ = nullptr;
+       other.in_index_ = nullptr;
+       other.in_neighbors_ = nullptr;
++      other.atlas_in_index_ = nullptr;
++      other.atlas_out_index_ = nullptr;
++      other.atlas_in_nsize_ = nullptr;
++      other.atlas_out_nsize_ = nullptr;
++      
+   }
+ 
+   ~CSRGraph() {
+@@ -182,6 +250,8 @@ class CSRGraph {
+       other.out_neighbors_ = nullptr;
+       other.in_index_ = nullptr;
+       other.in_neighbors_ = nullptr;
++      other.atlas_in_nsize_ = nullptr;
++      other.atlas_out_nsize_ = nullptr;
+     }
+     return *this;
+   }
+@@ -215,6 +285,11 @@ class CSRGraph {
+     return Neighborhood(n, out_index_, start_offset);
+   }
+ 
++  AtlasNeighborhood atlas_out_neigh(NodeID_ n, OffsetT raw_offset, OffsetT start_offset = 0) const {
++    BARRIER_ASSERT(atlas_out_index_ != nullptr);
++    return AtlasNeighborhood(n, atlas_out_nsize_, atlas_out_index_, start_offset, raw_offset);
++  }
++
+   Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
+     static_assert(MakeInverse, "Graph inversion disabled but reading inverse");
+     return Neighborhood(n, in_index_, start_offset);
+@@ -248,6 +323,46 @@ class CSRGraph {
+     return index;
+   }
+ 
++  static atlas::AtlasUniquePtr<DestID_>* AtlasGenIndex(const pvector<SGOffset> &offsets, DestID_* neighs) {
++    NodeID_ length = offsets.size();
++    atlas::AtlasUniquePtr<DestID_>* index = new atlas::AtlasUniquePtr<DestID_>[length];
++    #pragma omp parallel for
++    for (NodeID_ n=0; n < length - 1; n++){
++      index[n].nullify();
++      index[n].reset(neighs + offsets[n], sizeof(NodeID_) * (offsets[n + 1] - offsets[n]));
++    }
++    index[length].reset(neighs + offsets[length], 0);
++    return index;
++  }
++
++  static unsigned* AtlasGenSize(const pvector<SGOffset> &offsets, DestID_* neighs) {
++    NodeID_ length = offsets.size();
++    unsigned* nsize = new unsigned[length];
++    #pragma omp parallel for
++    for (NodeID_ n=0; n < length - 1; n++){
++      nsize[n] = offsets[n + 1] - offsets[n];
++    }
++    nsize[length] = 0;
++    return nsize;
++  }
++
++  static atlas::AtlasUniquePtr<DestID_>* AtlasFromIndex(const DestID_** index, NodeID_ length) {
++    atlas::AtlasUniquePtr<DestID_>* atlas_index = new atlas::AtlasUniquePtr<DestID_>[length];
++    #pragma omp parallel for
++    for (NodeID_ n=0; n < length - 1; n++){
++      atlas_index[n].nullify();
++      atlas_index[n].reset(const_cast<DestID_*>(index[n]), sizeof(NodeID_) * (index[n + 1] - index[n]));
++      // asm volatile("" ::: "memory");
++      // if(atlas_index[n].deref_get() != index[n]){
++      //   fprintf(stderr, "From Index Error ! %d, %p, %p\n", n, atlas_index[n].deref_get(), index[n]);
++      //   exit(1);
++      // }
++    }
++    atlas_index[length].reset(const_cast<DestID_*>(index[length]), 0);
++    printf("finish atlas index\n");
++    return atlas_index;
++  }
++
+   pvector<SGOffset> VertexOffsets(bool in_graph = false) const {
+     pvector<SGOffset> offsets(num_nodes_+1);
+     for (NodeID_ n=0; n < num_nodes_+1; n++)
+@@ -262,6 +377,33 @@ class CSRGraph {
+     return Range<NodeID_>(num_nodes());
+   }
+ 
++  bool enable_atlas() const {
++    return atlas_in_index_ != nullptr;
++  }
++
++  void ReleaseResources() {
++    if (out_index_ != nullptr)
++      delete[] out_index_;
++    if (out_neighbors_ != nullptr)
++      delete[] out_neighbors_;
++    if (directed_) {
++      if (in_index_ != nullptr)
++        delete[] in_index_;
++      if (in_neighbors_ != nullptr)
++        delete[] in_neighbors_;
++    }
++      if(atlas_in_index_)
++        delete[] atlas_in_index_;
++      if(atlas_out_index_ && atlas_out_index_ != atlas_in_index_)
++        delete[] atlas_out_index_;
++
++      if(atlas_in_nsize_)
++        delete[] atlas_in_nsize_;
++      if(atlas_out_nsize_ && atlas_out_nsize_ != atlas_in_nsize_)
++        delete[] atlas_out_nsize_;
++  }
++
++
+  private:
+   bool directed_;
+   int64_t num_nodes_;
+@@ -270,6 +412,10 @@ class CSRGraph {
+   DestID_*  out_neighbors_;
+   DestID_** in_index_;
+   DestID_*  in_neighbors_;
++  atlas::AtlasUniquePtr<DestID_>* atlas_in_index_;
++  atlas::AtlasUniquePtr<DestID_>* atlas_out_index_;
++  unsigned * atlas_in_nsize_;
++  unsigned * atlas_out_nsize_;
+ };
+ 
+ #endif  // GRAPH_H_
+diff --git a/src/reader.h b/src/reader.h
+index 2ddd686..5ac3b0b 100644
+--- a/src/reader.h
++++ b/src/reader.h
+@@ -251,7 +251,7 @@ class Reader {
+     return el;
+   }
+ 
+-  CSRGraph<NodeID_, DestID_, invert> ReadSerializedGraph() {
++  CSRGraph<NodeID_, DestID_, invert> ReadSerializedGraph(bool atlas = false) {
+     bool weighted = GetSuffix() == ".wsg";
+     if (!std::is_same<NodeID_, SGID>::value) {
+       std::cout << "serialized graphs only allowed for 32bit" << std::endl;
+@@ -280,6 +280,10 @@ class Reader {
+     SGOffset num_nodes, num_edges;
+     DestID_ **index = nullptr, **inv_index = nullptr;
+     DestID_ *neighs = nullptr, *inv_neighs = nullptr;
++    unsigned *nsize = nullptr, *inv_nsize = nullptr;
++    atlas::AtlasUniquePtr<DestID_> *atlas_index = nullptr;
++    atlas::AtlasUniquePtr<DestID_> *atlas_inv_index = nullptr;
++
+     file.read(reinterpret_cast<char*>(&directed), sizeof(bool));
+     file.read(reinterpret_cast<char*>(&num_edges), sizeof(SGOffset));
+     file.read(reinterpret_cast<char*>(&num_nodes), sizeof(SGOffset));
+@@ -289,21 +293,35 @@ class Reader {
+     std::streamsize num_neigh_bytes = num_edges * sizeof(DestID_);
+     file.read(reinterpret_cast<char*>(offsets.data()), num_index_bytes);
+     file.read(reinterpret_cast<char*>(neighs), num_neigh_bytes);
++
+     index = CSRGraph<NodeID_, DestID_>::GenIndex(offsets, neighs);
++    if(atlas){
++      atlas_index = CSRGraph<NodeID_, DestID_>::AtlasGenIndex(offsets, neighs);
++      nsize = CSRGraph<NodeID_, DestID_>::AtlasGenSize(offsets, neighs);
++    }
++
+     if (directed && invert) {
+       inv_neighs = new DestID_[num_edges];
+       file.read(reinterpret_cast<char*>(offsets.data()), num_index_bytes);
+       file.read(reinterpret_cast<char*>(inv_neighs), num_neigh_bytes);
++
+       inv_index = CSRGraph<NodeID_, DestID_>::GenIndex(offsets, inv_neighs);
++      if(atlas){
++        atlas_inv_index = CSRGraph<NodeID_, DestID_>::AtlasGenIndex(offsets, inv_neighs);
++        inv_nsize = CSRGraph<NodeID_, DestID_>::AtlasGenSize(offsets, inv_neighs);
++      }
+     }
+     file.close();
+     t.Stop();
+     PrintTime("Read Time", t.Seconds());
+-    if (directed)
++    if (directed){
+       return CSRGraph<NodeID_, DestID_, invert>(num_nodes, index, neighs,
+-                                                inv_index, inv_neighs);
+-    else
+-      return CSRGraph<NodeID_, DestID_, invert>(num_nodes, index, neighs);
++                                            inv_index, inv_neighs, atlas_index, atlas_inv_index, 
++                                            nsize, inv_nsize);
++    }
++    else{
++      return CSRGraph<NodeID_, DestID_, invert>(num_nodes, index, neighs, atlas_index, nsize);
++    }
+   }
+ };
+ 
+diff --git a/src/tc.cc b/src/tc.cc
+index 0c87df4..cb3b4be 100644
+--- a/src/tc.cc
++++ b/src/tc.cc
+@@ -10,6 +10,7 @@
+ #include <cinttypes>
+ #include <iostream>
+ #include <vector>
++#include <cstring>
+ 
+ #include "benchmark.h"
+ #include "builder.h"
+@@ -50,6 +51,9 @@ to relabel the graph, we use the heuristic in WorthRelabelling.
+ using namespace std;
+ 
+ size_t OrderedCount(const Graph &g) {
++  // int r;
++  // r = system("bash /home/chenlei/Downloads/linux-5.14-clean/tools/hermit/reset.sh");
++  // printf("Finish reset stats: %d\n", r);
+   size_t total = 0;
+   #pragma omp parallel for reduction(+ : total) schedule(dynamic, 64)
+   for (NodeID u=0; u < g.num_nodes(); u++) {
+@@ -70,6 +74,36 @@ size_t OrderedCount(const Graph &g) {
+   return total;
+ }
+ 
++size_t AtlasOrderedCount(const Graph &g) {
++  // int r;
++  // r = system("bash /home/chenlei/Downloads/linux-5.14-clean/tools/hermit/reset.sh");
++  // printf("Finish reset stats: %d\n", r);
++  size_t total = 0;
++  #pragma omp parallel for reduction(+ : total) schedule(dynamic, 64)
++  for (NodeID u=0; u < g.num_nodes(); u++) {
++    auto u_nbrs = g.out_neigh(u);
++    // auto u_nbrs = g.atlas_out_neigh(u, 0);
++    for (NodeID* vptr = u_nbrs.begin(); vptr < u_nbrs.end(); vptr ++ ) {
++      NodeID v = *vptr;
++      if (v > u)
++        break;
++      auto it = u_nbrs.begin();
++      auto v_nbrs = g.atlas_out_neigh(v, 0);
++      // auto v_nbrs = g.out_neigh(v);
++      for (NodeID *wptr = v_nbrs.begin(); wptr < v_nbrs.end(); wptr ++) {
++        NodeID w = *wptr;
++        if (w > v)
++          break;
++        while (*it < w)
++          it++;
++        if (w == *it)
++          total++;
++      }
++    }
++  }
++  return total;
++}
++
+ 
+ // heuristic to see if sufficently dense power-law graph
+ bool WorthRelabelling(const Graph &g) {
+@@ -90,11 +124,25 @@ bool WorthRelabelling(const Graph &g) {
+   return sample_average / 1.3 > sample_median;
+ }
+ 
+-
++bool g_atlas = true;
+ // uses heuristic to see if worth relabeling
+ size_t Hybrid(const Graph &g) {
+-  if (WorthRelabelling(g))
+-    return OrderedCount(Builder::RelabelByDegree(g));
++  fprintf(stderr, "before create new resources, what's the memory usage?\n");
++  // int x;
++  // std::cin >> x;
++  if (WorthRelabelling(g)){
++    auto new_g = Builder::RelabelByDegree(g);
++    const_cast<Graph&>(g).ReleaseResources();
++    printf("after release, what is the real memory usage?\n");
++    // std::cin >> x;
++    if(g_atlas)
++      return AtlasOrderedCount(new_g);
++    else
++      return OrderedCount(new_g);
++  }
++
++  else if(g_atlas)
++    return AtlasOrderedCount(g);
+   else
+     return OrderedCount(g);
+ }
+@@ -132,12 +180,22 @@ int main(int argc, char* argv[]) {
+   CLApp cli(argc, argv, "triangle count");
+   if (!cli.ParseArgs())
+     return -1;
++  g_atlas = cli.enable_atlas();
++  if(g_atlas){
++    printf("Enable Atlas Runtime\n");
++    runtime_init();
++    printf("Enable Object Fetch\n");
++    memset(global_psf, 0x1, BKS_PSF_MMAP_SIZE);
++  }else{
++    printf("Disable Atlas Runtime\n");
++  }
+   Builder b(cli);
+-  Graph g = b.MakeGraph();
++  Graph g = b.MakeGraph(g_atlas);
+   if (g.directed()) {
+     cout << "Input graph is directed but tc requires undirected" << endl;
+     return -2;
+   }
++
+   BenchmarkKernel(cli, g, Hybrid, PrintTriangleStats, TCVerifier);
+   return 0;
+ }
+-- 
+2.25.1
+

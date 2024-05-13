@@ -1,0 +1,274 @@
+From ba86369da11ccdab561608d799eb382279104ca6 Mon Sep 17 00:00:00 2001
+From: Lei Chen <ls.cat@outlook.com>
+Date: Fri, 25 Nov 2022 16:24:56 +0800
+Subject: [PATCH 1/4] feat-wip: redis with atlas runtime
+
+---
+ src/Makefile     |  5 +++++
+ src/db.c         |  9 +++++++++
+ src/networking.c | 10 +++++++++-
+ src/object.c     | 13 +++++++++++++
+ src/rdb.c        | 11 +++++++++++
+ src/sds.h        | 19 +++++++++++++++++++
+ src/server.c     |  3 +++
+ src/server.h     |  1 +
+ src/t_string.c   | 13 ++++++++++++-
+ 9 files changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/src/Makefile b/src/Makefile
+index e4f7d9068..e94a2ae1d 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -120,6 +120,11 @@ FINAL_LDFLAGS=$(LDFLAGS) $(REDIS_LDFLAGS) $(DEBUG)
+ FINAL_LIBS=-lm
+ DEBUG=-g -ggdb
+ 
++ATLAS_PATH=/ssd/chenlei/atlas/Paris
++FINAL_CFLAGS+=  -I$(ATLAS_PATH)/runtime/include -I$(ATLAS_PATH)/bks_module/include
++FINAL_LDFLAGS+= -L$(ATLAS_PATH)/build/runtime/lib
++FINAL_LIBS+= -lparis
++
+ # Linux ARM32 needs -latomic at linking time
+ ifneq (,$(findstring armv,$(uname_M)))
+         FINAL_LIBS+=-latomic
+diff --git a/src/db.c b/src/db.c
+index 3fd4938af..3ccd1bee7 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -33,6 +33,7 @@
+ #include "latency.h"
+ #include "script.h"
+ #include "functions.h"
++#include "atlas.h"
+ 
+ #include <signal.h>
+ #include <ctype.h>
+@@ -124,6 +125,7 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
+         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
+             server.stat_keyspace_hits++;
+         /* TODO: Use separate hits stats for WRITE */
++        serverLog(LL_NOTICE,"get val refcnt %d\n", val->refcount); 
+     } else {
+         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE)))
+             notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
+@@ -190,6 +192,10 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
+     dictEntry *de = dictAddRaw(db->dict, copy, NULL);
+     serverAssertWithInfo(NULL, key, de != NULL);
+     dictSetVal(db->dict, de, val);
++    if((db->dict)->type->valDup)
++        serverLog(LL_NOTICE,"val dup\n");
++    else
++        serverLog(LL_NOTICE,"no val dup\n");
+     signalKeyAsReady(db, key, val->type);
+     if (server.cluster_enabled) slotToKeyAddEntry(de, db);
+     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
+@@ -260,6 +266,9 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
+  * in a context where there is no clear client performing the operation. */
+ void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
+     int keyfound = 0;
++    atlas_unique_ptr up = atlas_make_unique_ptr(val, 1);
++    serverLog(LL_NOTICE,"SET KEY, flag & exist %d, doenot %d, up handle %lx\n",
++        flags & SETKEY_ALREADY_EXIST, !(flags & SETKEY_DOESNT_EXIST), up.handle);
+ 
+     if (flags & SETKEY_ALREADY_EXIST)
+         keyfound = 1;
+diff --git a/src/networking.c b/src/networking.c
+index e8a93dde3..3a22d95d8 100644
+--- a/src/networking.c
++++ b/src/networking.c
+@@ -31,6 +31,7 @@
+ #include "atomicvar.h"
+ #include "cluster.h"
+ #include "script.h"
++#include "atlas.h"
+ #include <sys/socket.h>
+ #include <sys/uio.h>
+ #include <math.h>
+@@ -406,7 +407,14 @@ void addReply(client *c, robj *obj) {
+     if (prepareClientToWrite(c) != C_OK) return;
+ 
+     if (sdsEncodedObject(obj)) {
+-        _addReplyToBufferOrList(c,obj->ptr,sdslen(obj->ptr));
++        if(sdsRawEncodedObject(obj) && is_atlas_ptr(obj->ptr)){
++            serverLog(LL_NOTICE,"atlas add reply %p\n", (void*)obj);
++            atlas_unique_ptr_wh* up = (atlas_unique_ptr_wh*)&obj->ptr;
++            void *ptr = atlas_upwh_deref_get(up);
++            _addReplyToBufferOrList(c,ptr,sdslen(ptr));
++            atlas_upwh_deref_put(up, ptr);
++        }else
++            _addReplyToBufferOrList(c,obj->ptr,sdslen(obj->ptr));
+     } else if (obj->encoding == OBJ_ENCODING_INT) {
+         /* For integer encoded strings we just convert it into a string
+          * using our optimized function, and attach the resulting string
+diff --git a/src/object.c b/src/object.c
+index 84a9e3afc..f138b8778 100644
+--- a/src/object.c
++++ b/src/object.c
+@@ -30,6 +30,7 @@
+ 
+ #include "server.h"
+ #include "functions.h"
++#include "atlas.h"
+ #include <math.h>
+ #include <ctype.h>
+ 
+@@ -289,6 +290,10 @@ robj *createModuleObject(moduleType *mt, void *value) {
+ 
+ void freeStringObject(robj *o) {
+     if (o->encoding == OBJ_ENCODING_RAW) {
++        if(is_atlas_ptr(o->ptr)){
++            serverLog(LL_NOTICE,"free atlas ptr %p\n", o->ptr); 
++            return;
++        }
+         sdsfree(o->ptr);
+     }
+ }
+@@ -769,7 +774,15 @@ int equalStringObjects(robj *a, robj *b) {
+ 
+ size_t stringObjectLen(robj *o) {
+     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
++    serverLog(LL_NOTICE,"strlen %p\n", (void*)o);
+     if (sdsEncodedObject(o)) {
++        if(sdsRawEncodedObject(o) && is_atlas_ptr(o->ptr)) {
++            atlas_unique_ptr_wh* up = (atlas_unique_ptr_wh*)&o->ptr;
++            void *ptr = atlas_upwh_deref_get(up);
++            size_t res = sdslen(ptr);
++            atlas_upwh_deref_put(up, ptr);
++            return res;
++        }
+         return sdslen(o->ptr);
+     } else {
+         return sdigits10((long)o->ptr);
+diff --git a/src/rdb.c b/src/rdb.c
+index b53fbdb21..a2de3026a 100644
+--- a/src/rdb.c
++++ b/src/rdb.c
+@@ -33,6 +33,7 @@
+ #include "endianconv.h"
+ #include "stream.h"
+ #include "functions.h"
++#include "atlas.h"
+ 
+ #include <math.h>
+ #include <fcntl.h>
+@@ -490,6 +491,16 @@ ssize_t rdbSaveStringObject(rio *rdb, robj *obj) {
+         return rdbSaveLongLongAsStringObject(rdb,(long)obj->ptr);
+     } else {
+         serverAssertWithInfo(NULL,obj,sdsEncodedObject(obj));
++
++        if(obj->encoding == OBJ_ENCODING_RAW && is_atlas_ptr(obj->ptr)){
++            serverLog(LL_NOTICE,"atlas save object %p\n", obj->ptr);
++            atlas_unique_ptr_wh* up = (atlas_unique_ptr_wh*)&obj->ptr;
++            void *ptr = atlas_upwh_deref_get(up);
++            size_t res = rdbSaveRawString(rdb,ptr,sdslen(ptr));
++            atlas_upwh_deref_put(up, ptr);
++            return res;
++        }
++
+         return rdbSaveRawString(rdb,obj->ptr,sdslen(obj->ptr));
+     }
+ }
+diff --git a/src/sds.h b/src/sds.h
+index 548ba231d..0b3e170c9 100644
+--- a/src/sds.h
++++ b/src/sds.h
+@@ -83,6 +83,25 @@ struct __attribute__ ((__packed__)) sdshdr64 {
+ #define SDS_HDR_VAR(T,s) struct sdshdr##T *sh = (void*)((s)-(sizeof(struct sdshdr##T)));
+ #define SDS_HDR(T,s) ((struct sdshdr##T *)((s)-(sizeof(struct sdshdr##T))))
+ #define SDS_TYPE_5_LEN(f) ((f)>>SDS_TYPE_BITS)
++#define SDS_HDR_LEN(T) (sizeof(struct sdshdr##T))
++
++/* [Atlas] */
++static inline size_t sdshdrlen(const sds s) {
++    unsigned char flags = s[-1];
++    switch(flags&SDS_TYPE_MASK) {
++        case SDS_TYPE_5:
++            return SDS_HDR_LEN(5);
++        case SDS_TYPE_8:
++            return SDS_HDR_LEN(8);
++        case SDS_TYPE_16:
++            return SDS_HDR_LEN(16);
++        case SDS_TYPE_32:
++            return SDS_HDR_LEN(32);
++        case SDS_TYPE_64:
++            return SDS_HDR_LEN(64);
++    }
++    return 0;
++}
+ 
+ static inline size_t sdslen(const sds s) {
+     unsigned char flags = s[-1];
+diff --git a/src/server.c b/src/server.c
+index b0cef8870..c9bbc0c8e 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -37,6 +37,7 @@
+ #include "mt19937-64.h"
+ #include "functions.h"
+ #include "syscheck.h"
++#include "atlas.h"
+ 
+ #include <time.h>
+ #include <signal.h>
+@@ -6780,6 +6781,8 @@ int main(int argc, char **argv) {
+     int j;
+     char config_from_stdin = 0;
+ 
++    atlas_init();
++
+ #ifdef REDIS_TEST
+     if (argc >= 3 && !strcasecmp(argv[1], "test")) {
+         int flags = 0;
+diff --git a/src/server.h b/src/server.h
+index 3f8f15336..da5951357 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -2656,6 +2656,7 @@ int equalStringObjects(robj *a, robj *b);
+ unsigned long long estimateObjectIdleTime(robj *o);
+ void trimStringObjectIfNeeded(robj *o);
+ #define sdsEncodedObject(objptr) (objptr->encoding == OBJ_ENCODING_RAW || objptr->encoding == OBJ_ENCODING_EMBSTR)
++#define sdsRawEncodedObject(objptr) (objptr->encoding == OBJ_ENCODING_RAW)
+ 
+ /* Synchronous I/O with timeout */
+ ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout);
+diff --git a/src/t_string.c b/src/t_string.c
+index 7b67b78ce..f1f5ce2f9 100644
+--- a/src/t_string.c
++++ b/src/t_string.c
+@@ -28,6 +28,7 @@
+  */
+ 
+ #include "server.h"
++#include "atlas.h"
+ #include <math.h> /* isnan(), isinf() */
+ 
+ /* Forward declarations */
+@@ -292,7 +293,16 @@ void setCommand(client *c) {
+         return;
+     }
+ 
+-    c->argv[2] = tryObjectEncoding(c->argv[2]);
++    robj *o = tryObjectEncoding(c->argv[2]);
++    if(sdsRawEncodedObject(o)){
++        sds s = o->ptr;
++        /* the total size is sdsalloc(s) + 1 + sdshrdlen(s), 1 for the '\0' char */
++        atlas_unique_ptr_wh up = atlas_make_unique_ptr_wh(s, sdsalloc(s) + 1, sdshdrlen(s));
++        o->ptr = (void*)up.handle;
++        serverLog(LL_NOTICE,"create atlas up, alloc size %ld, hdrlen %ld\n", sdsalloc(s), sdshdrlen(s));
++    }
++    c->argv[2] = o;
++
+     setGenericCommand(c,flags,c->argv[1],c->argv[2],expire,unit,NULL,NULL);
+ }
+ 
+@@ -321,6 +331,7 @@ int getGenericCommand(client *c) {
+         return C_ERR;
+     }
+ 
++    serverLog(LL_NOTICE,"atlas obj encoding %d\n", o->encoding);
+     addReplyBulk(c,o);
+     return C_OK;
+ }
+-- 
+2.25.1
+

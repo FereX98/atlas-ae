@@ -1,0 +1,946 @@
+From 586af3afdc42d9065c8a205a802c4a949b659cf4 Mon Sep 17 00:00:00 2001
+From: Lei Chen <ls.cat@outlook.com>
+Date: Wed, 30 Nov 2022 15:25:19 +0800
+Subject: [PATCH 1/4] feat: atlas runtime for get/add/set
+
+---
+ Makefile.am  | 10 ++++++-
+ assoc.c      | 81 +++++++++++++++++++++++++++++++++++++++++-----------
+ assoc.h      |  3 ++
+ atlas.h      | 52 +++++++++++++++++++++++++++++++++
+ items.c      | 65 ++++++++++++++++++-----------------------
+ items.h      |  7 +++--
+ memcached.c  | 44 +++++++++++++++++++---------
+ memcached.h  | 12 ++++----
+ proto_bin.c  | 15 ++++++----
+ proto_text.c | 37 ++++++++++++++++--------
+ slabs.c      |  2 +-
+ storage.c    |  4 +--
+ thread.c     | 18 ++++++------
+ 13 files changed, 245 insertions(+), 105 deletions(-)
+ create mode 100644 atlas.h
+
+diff --git a/Makefile.am b/Makefile.am
+index 2910b46..4689caa 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -81,11 +81,19 @@ memcached_CPPFLAGS = -DNDEBUG
+ memcached_debug_LDADD = @PROFILER_LDFLAGS@
+ memcached_debug_CFLAGS = @PROFILER_FLAGS@
+ 
+-memcached_LDADD =
++paris_PATH = /ssd/chenlei/atlas/Paris
++paris_INC_FLAG = -I${paris_PATH}/runtime/include -I${paris_PATH}/bks_module/include 
++paris_LIB_FLAG = -L${paris_PATH}/build/runtime/lib
++memcached_LDADD = 
+ memcached_DEPENDENCIES =
+ memcached_debug_DEPENDENCIES =
+ CLEANFILES=
+ 
++memcached_CFLAGS = ${paris_INC_FLAG} ${paris_LIB_FLAG}
++memcached_LDADD += -lparis
++memcached_debug_CFLAGS += ${paris_INC_FLAG} ${paris_LIB_FLAG}
++memcached_debug_LDADD += -lparis
++
+ if BUILD_LINUX_PRIVS
+ memcached_LDADD += -lseccomp
+ memcached_debug_LDADD += -lseccomp
+diff --git a/assoc.c b/assoc.c
+index bc68695..e9334fc 100644
+--- a/assoc.c
++++ b/assoc.c
+@@ -12,6 +12,7 @@
+  */
+ 
+ #include "memcached.h"
++#include "atlas.h"
+ #include <sys/stat.h>
+ #include <sys/socket.h>
+ #include <sys/resource.h>
+@@ -67,6 +68,30 @@ void assoc_init(const int hashtable_init) {
+     STATS_UNLOCK();
+ }
+ 
++
++item *atlas_assoc_find_paging(const char *key, const size_t nkey, const uint32_t hv, atlas_unique_ptr **up) {
++    item *it;
++    BARRIER_ASSERT(!expanding);
++
++    it = atlas_get_item(&primary_hashtable[hv & hashmask(hashpower)], up, true /* force_paging */);
++
++    item *ret = NULL;
++    int depth = 0;
++    while (it) {
++        if ((nkey == it->nkey) && (memcmp(key, ITEM_key(it), nkey) == 0)) {
++            ret = it;
++            break;
++        }
++        atlas_unique_ptr *up_old = *up;
++        item *old_it = it;
++        it = atlas_get_item(&it->h_next, up, true /* force_paging */);
++        ++depth;
++        atlas_put_item(up_old, old_it);
++    }
++    MEMCACHED_ASSOC_FIND(key, nkey, depth);
++    return ret;
++}
++
+ item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
+     item *it;
+     uint64_t oldbucket;
+@@ -96,21 +121,24 @@ item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
+ /* returns the address of the item pointer before the key.  if *item == 0,
+    the item wasn't found */
+ 
+-static item** _hashitem_before (const char *key, const size_t nkey, const uint32_t hv) {
++static item** _hashitem_before (const char *key, const size_t nkey, const uint32_t hv, item **it_ptr, atlas_unique_ptr **up) {
+     item **pos;
+-    uint64_t oldbucket;
+-
+-    if (expanding &&
+-        (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
+-    {
+-        pos = &old_hashtable[oldbucket];
+-    } else {
+-        pos = &primary_hashtable[hv & hashmask(hashpower)];
+-    }
+-
+-    while (*pos && ((nkey != (*pos)->nkey) || memcmp(key, ITEM_key(*pos), nkey))) {
+-        pos = &(*pos)->h_next;
++    BARRIER_ASSERT(!expanding);
++    pos = &primary_hashtable[hv & hashmask(hashpower)];
++    atlas_unique_ptr *it_up = NULL;
++    item *it = NULL;
++    while(true){
++        it = atlas_get_item(pos, &it_up, true /* force_paging */);
++        if(it && ((nkey != it->nkey) || memcmp(key, ITEM_key(it), nkey))){
++            pos = &it->h_next;
++            /* [Atlas] simply drop the refcnt, as the raw ptr is protected by memcached's hv lock */
++            atlas_put_item(it_up, it);
++            continue;
++        }
++        break;
+     }
++    *it_ptr = it;
++    *up = it_up;
+     return pos;
+ }
+ 
+@@ -145,6 +173,20 @@ void assoc_start_expand(uint64_t curr_items) {
+     }
+ }
+ 
++int atlas_assoc_insert_get(item *it, const uint32_t hv, atlas_unique_ptr**up) {
++    BARRIER_ASSERT(!expanding);
++    it->h_next = primary_hashtable[hv & hashmask(hashpower)];
++    atlas_unique_ptr unique_ptr = atlas_make_unique_ptr(it, ITEM_ntotal(it));
++    /* add the refcnt mannually */
++    item * it_get = atlas_up_deref_get(&unique_ptr);
++    BARRIER_ASSERT(it_get == it);
++    primary_hashtable[hv & hashmask(hashpower)] = (item*)unique_ptr.handle;
++    *up = (atlas_unique_ptr*)&primary_hashtable[hv & hashmask(hashpower)];
++
++    MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey);
++    return 1;
++}
++
+ /* Note: this isn't an assoc_update.  The key must not already exist to call this */
+ int assoc_insert(item *it, const uint32_t hv) {
+     uint64_t oldbucket;
+@@ -166,22 +208,27 @@ int assoc_insert(item *it, const uint32_t hv) {
+ }
+ 
+ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
+-    item **before = _hashitem_before(key, nkey, hv);
++    item *it = NULL;
++    atlas_unique_ptr *it_up = NULL;
++    item **before = _hashitem_before(key, nkey, hv, &it, &it_up);
++    fprintf(stderr, "old item %p, unique_ptr handle 0x%lx", (void*)it, it_up->handle);
+ 
+-    if (*before) {
++    if (it) {
+         item *nxt;
+         /* The DTrace probe cannot be triggered as the last instruction
+          * due to possible tail-optimization by the compiler
+          */
+         MEMCACHED_ASSOC_DELETE(key, nkey);
+-        nxt = (*before)->h_next;
+-        (*before)->h_next = 0;   /* probably pointless, but whatever. */
++        nxt = it->h_next;
++        it->h_next = 0;   /* probably pointless, but whatever. */
+         *before = nxt;
++        atlas_put_item(it_up, it);
+         return;
+     }
+     /* Note:  we never actually get here.  the callers don't delete things
+        they can't find. */
+     assert(*before != 0);
++    fprintf(stderr, "atlas delete ok\n");
+ }
+ 
+ 
+diff --git a/assoc.h b/assoc.h
+index 457ca25..4c0129b 100644
+--- a/assoc.h
++++ b/assoc.h
+@@ -1,7 +1,10 @@
+ /* associative array */
+ void assoc_init(const int hashpower_init);
+ item *assoc_find(const char *key, const size_t nkey, const uint32_t hv);
++struct atlas_unique_ptr;
++item *atlas_assoc_find_paging(const char *key, const size_t nkey, const uint32_t hv, struct atlas_unique_ptr **up);
+ int assoc_insert(item *item, const uint32_t hv);
++int atlas_assoc_insert_get(item *it, const uint32_t hv, struct atlas_unique_ptr**up);
+ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv);
+ void do_assoc_move_next_bucket(void);
+ int start_assoc_maintenance_thread(void);
+diff --git a/atlas.h b/atlas.h
+new file mode 100644
+index 0000000..363f652
+--- /dev/null
++++ b/atlas.h
+@@ -0,0 +1,52 @@
++#pragma once
++#include <runtime.h>
++#include <pointer_shim.h>
++#include <bks_types.h>
++#include <string.h>
++#include "memcached.h"
++
++extern void *global_psf;
++
++static void inline atlas_init()
++{
++    runtime_init();
++    /* set the psf to paging-in manually */
++    memset(global_psf, 0x0, BKS_PSF_MMAP_SIZE);
++}
++
++/* [Atlas] as the orig object ptr is 0x7fxxxxx, the most siginificant bit of our unique ptr metadata must be 1 */
++static inline bool is_atlas_ptr(void *ptr)
++{
++    return (uintptr_t)ptr >> 63;
++}
++
++#define BARRIER_ASSERT(x)                                                     \
++    do                                                                        \
++    {                                                                         \
++        if (!(x))                                                             \
++        {                                                                     \
++            fprintf(stderr, "[%s:%d] Assertion failed:", __FILE__, __LINE__); \
++            fputs(#x "\n", stderr);                                           \
++            abort();                                                          \
++        }                                                                     \
++    } while (0)
++
++
++static inline item* atlas_get_item(item** item_ptr, atlas_unique_ptr **up, bool force_paging){
++    item* ret = *item_ptr;
++    if(is_atlas_ptr(ret)){
++        *up = (atlas_unique_ptr*)item_ptr;
++
++        ret = force_paging ? atlas_up_deref_get_paging(*up) 
++                           : atlas_up_deref_get(*up);
++    }else{
++        *up = NULL;
++    }
++    return ret;
++}
++
++static inline void atlas_put_item(atlas_unique_ptr *up, void *ptr){
++    if(up){
++        atlas_up_deref_put(up, ptr);
++    }
++}
+\ No newline at end of file
+diff --git a/items.c b/items.c
+index c526310..d76d591 100644
+--- a/items.c
++++ b/items.c
+@@ -6,6 +6,7 @@
+ #ifdef EXTSTORE
+ #include "slab_automove_extstore.h"
+ #endif
++#include "atlas.h"
+ #include <sys/stat.h>
+ #include <sys/socket.h>
+ #include <sys/resource.h>
+@@ -21,6 +22,8 @@
+ #include <unistd.h>
+ #include <poll.h>
+ 
++#pragma GCC diagnostic ignored "-Wunused-function"
++
+ /* Forward Declarations */
+ static void item_link_q(item *it);
+ static void item_unlink_q(item *it);
+@@ -281,6 +284,7 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
+     /* This is a large item. Allocate a header object now, lazily allocate
+      *  chunks while reading the upload.
+      */
++    fprintf(stderr, "alloc: chunk size max %d, flags %d, ntotal %ld\n", settings.slab_chunk_size_max, flags, ntotal);
+     if (ntotal > settings.slab_chunk_size_max) {
+         /* We still link this item into the LRU for the larger slab class, but
+          * we're pulling a header from an entirely different slab class. The
+@@ -314,6 +318,7 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
+     }
+ 
+     assert(it->it_flags == 0 || it->it_flags == ITEM_CHUNKED);
++    fprintf(stderr, "it flags %d\n", it->it_flags);
+     //assert(it != heads[id]);
+ 
+     /* Refcount is seeded to 1 by slabs_alloc() */
+@@ -324,12 +329,15 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
+      */
+     if (settings.temp_lru &&
+             exptime - current_time <= settings.temporary_ttl) {
++        fprintf(stderr, "temp lru\n");
+         id |= TEMP_LRU;
+     } else if (settings.lru_segmented) {
+         id |= HOT_LRU;
++        fprintf(stderr, "hot lru\n");
+     } else {
+         /* There is only COLD in compat-mode */
+         id |= COLD_LRU;
++        fprintf(stderr, "cold lru\n");
+     }
+     it->slabs_clsid = id;
+ 
+@@ -496,7 +504,10 @@ static void item_unlink_q(item *it) {
+     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+ }
+ 
+-int do_item_link(item *it, const uint32_t hv) {
++int do_item_link(item *it, const uint32_t hv, atlas_unique_ptr **up) {
++    if(!up){
++        BARRIER_ASSERT(false && "Not implemented");
++    }
+     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
+     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
+     it->it_flags |= ITEM_LINKED;
+@@ -510,8 +521,8 @@ int do_item_link(item *it, const uint32_t hv) {
+ 
+     /* Allocate a new CAS ID on link. */
+     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+-    assoc_insert(it, hv);
+-    item_link_q(it);
++    atlas_assoc_insert_get(it, hv, up);
++    // item_link_q(it);
+     refcount_incr(it);
+     item_stats_sizes_add(it);
+ 
+@@ -527,8 +538,9 @@ void do_item_unlink(item *it, const uint32_t hv) {
+         stats_state.curr_items -= 1;
+         STATS_UNLOCK();
+         item_stats_sizes_remove(it);
++        fprintf(stderr, "unlinked item %p\n", (void*)it);
+         assoc_delete(ITEM_key(it), it->nkey, hv);
+-        item_unlink_q(it);
++        // item_unlink_q(it);
+         do_item_remove(it);
+     }
+ }
+@@ -561,41 +573,17 @@ void do_item_remove(item *it) {
+ 
+ /* Bump the last accessed time, or relink if we're in compat mode */
+ void do_item_update(item *it) {
+-    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+-
+-    /* Hits to COLD_LRU immediately move to WARM. */
+-    if (settings.lru_segmented) {
+-        assert((it->it_flags & ITEM_SLABBED) == 0);
+-        if ((it->it_flags & ITEM_LINKED) != 0) {
+-            if (ITEM_lruid(it) == COLD_LRU && (it->it_flags & ITEM_ACTIVE)) {
+-                it->time = current_time;
+-                item_unlink_q(it);
+-                it->slabs_clsid = ITEM_clsid(it);
+-                it->slabs_clsid |= WARM_LRU;
+-                it->it_flags &= ~ITEM_ACTIVE;
+-                item_link_q_warm(it);
+-            } else {
+-                it->time = current_time;
+-            }
+-        }
+-    } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+-        assert((it->it_flags & ITEM_SLABBED) == 0);
+-
+-        if ((it->it_flags & ITEM_LINKED) != 0) {
+-            it->time = current_time;
+-            item_unlink_q(it);
+-            item_link_q(it);
+-        }
+-    }
++    // MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
++    fprintf(stderr, "update lru segmented %d\n",settings.lru_segmented);
+ }
+ 
+-int do_item_replace(item *it, item *new_it, const uint32_t hv) {
++int do_item_replace(item *it, item *new_it, const uint32_t hv, atlas_unique_ptr** new_it_up) {
+     MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
+                            ITEM_key(new_it), new_it->nkey, new_it->nbytes);
+     assert((it->it_flags & ITEM_SLABBED) == 0);
+ 
+     do_item_unlink(it, hv);
+-    return do_item_link(new_it, hv);
++    return do_item_link(new_it, hv, new_it_up);
+ }
+ 
+ /*@null@*/
+@@ -975,8 +963,12 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
+ }
+ 
+ /** wrapper around assoc_find which does the lazy expiration logic */
+-item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update) {
+-    item *it = assoc_find(key, nkey, hv);
++item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update, atlas_unique_ptr**up) {
++    if(!up){
++        BARRIER_ASSERT(false && "Not implemented\n");
++    }
++    // item *it = assoc_find(key, nkey, hv);
++    item *it = atlas_assoc_find_paging(key, nkey, hv, up);
+     if (it != NULL) {
+         refcount_incr(it);
+         /* Optimization for slab reassignment. prevents popular items from
+@@ -1041,9 +1033,6 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
+             }
+             was_found = 3;
+         } else {
+-            if (do_update) {
+-                do_item_bump(c, it, hv);
+-            }
+             DEBUG_REFCNT(it, '+');
+         }
+     }
+@@ -1089,7 +1078,7 @@ void do_item_bump(conn *c, item *it, const uint32_t hv) {
+ 
+ item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
+                     const uint32_t hv, conn *c) {
+-    item *it = do_item_get(key, nkey, hv, c, DO_UPDATE);
++    item *it = do_item_get(key, nkey, hv, c, DO_UPDATE, NULL);
+     if (it != NULL) {
+         it->exptime = exptime;
+     }
+diff --git a/items.h b/items.h
+index cb25cfa..5f38784 100644
+--- a/items.h
++++ b/items.h
+@@ -17,13 +17,14 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id);
+ void item_free(item *it);
+ bool item_size_ok(const size_t nkey, const int flags, const int nbytes);
+ 
+-int  do_item_link(item *it, const uint32_t hv);     /** may fail if transgresses limits */
++struct atlas_unique_ptr;
++int  do_item_link(item *it, const uint32_t hv, struct atlas_unique_ptr **up);     /** may fail if transgresses limits */
+ void do_item_unlink(item *it, const uint32_t hv);
+ void do_item_unlink_nolock(item *it, const uint32_t hv);
+ void do_item_remove(item *it);
+ void do_item_update(item *it);   /** update LRU time to current and reposition */
+ void do_item_update_nolock(item *it);
+-int  do_item_replace(item *it, item *new_it, const uint32_t hv);
++int  do_item_replace(item *it, item *new_it, const uint32_t hv, struct atlas_unique_ptr **up);
+ void do_item_link_fixup(item *it);
+ 
+ int item_is_flushed(item *it);
+@@ -71,7 +72,7 @@ typedef struct {
+ } item_stats_automove;
+ void fill_item_stats_automove(item_stats_automove *am);
+ 
+-item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update);
++item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update, struct atlas_unique_ptr **up);
+ item *do_item_touch(const char *key, const size_t nkey, uint32_t exptime, const uint32_t hv, conn *c);
+ void do_item_bump(conn *c, item *it, const uint32_t hv);
+ void item_stats_reset(void);
+diff --git a/memcached.c b/memcached.c
+index 7871fe8..2f04db9 100644
+--- a/memcached.c
++++ b/memcached.c
+@@ -17,6 +17,7 @@
+ #include "storage.h"
+ #include "authfile.h"
+ #include "restart.h"
++#include "atlas.h"
+ #include <sys/stat.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
+@@ -1564,9 +1565,11 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
+  *
+  * Returns the state of storage.
+  */
+-enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
++enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv, atlas_unique_ptr **it_up) {
+     char *key = ITEM_key(it);
+-    item *old_it = do_item_get(key, it->nkey, hv, c, DONT_UPDATE);
++    atlas_unique_ptr *old_up = NULL; 
++    item *old_it = do_item_get(key, it->nkey, hv, c, false, &old_up);
++    // item *old_it = do_item_get(key, it->nkey, hv, c, DONT_UPDATE);
+     enum store_item_type stored = NOT_STORED;
+ 
+     enum cas_result { CAS_NONE, CAS_MATCH, CAS_BADVAL, CAS_STALE, CAS_MISS };
+@@ -1595,7 +1598,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
+         switch (comm) {
+             case NREAD_ADD:
+                 /* add only adds a nonexistent item, but promote to head of LRU */
++                fprintf(stderr, "add to an exist key\n");
+                 do_item_update(old_it);
++                fprintf(stderr, "finish update\n");
+                 break;
+             case NREAD_CAS:
+                 if (cas_res == CAS_MATCH) {
+@@ -1674,11 +1679,22 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
+ 
+         if (do_store) {
+             STORAGE_delete(c->thread->storage, old_it);
+-            item_replace(old_it, it, hv);
++            fprintf(stderr, "before do store: old_it %p, old_up %p, it %p\n", (void*)old_it, (void*)old_up, (void*)it);
++            if(old_it != NULL){
++                fprintf(stderr, "before do store: old it not null: old up val 0x%lx\n", old_up->handle);
++            }
++            item_replace(old_it, it, hv, it_up);
++            fprintf(stderr, "end do store \n");
+             stored = STORED;
+         }
+ 
++        fprintf(stderr, "old it %p, old_up 0x%lx\n", (void*)old_it, old_up->handle);
+         do_item_remove(old_it);         /* release our reference */
++        /* [Atlas] after item_replace, the old_up has been destroyed, and in fact, it points to the unique ptr of `it` now */
++        if(!do_store){
++            atlas_put_item(old_up, old_it);
++        }
++        fprintf(stderr, "after remove old it %p, old_up 0x%lx\n", (void*)old_it, old_up->handle);
+         if (new_it != NULL) {
+             // append/prepend end up with an extra reference for new_it.
+             do_item_remove(new_it);
+@@ -1710,7 +1726,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
+         }
+ 
+         if (do_store) {
+-            do_item_link(it, hv);
++            do_item_link(it, hv, it_up);
+             stored = STORED;
+         }
+     }
+@@ -1721,7 +1737,8 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
+     LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
+             stored, comm, ITEM_key(it), it->nkey, it->nbytes, it->exptime,
+             ITEM_clsid(it), c->sfd);
+-
++    // atlas_assoc_insert_get(
++    fprintf(stderr, "finish comlete nread\n");
+     return stored;
+ }
+ 
+@@ -2185,13 +2202,11 @@ void process_stats_conns(ADD_STAT add_stats, void *c) {
+ }
+ 
+ #define IT_REFCOUNT_LIMIT 60000
+-item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch, bool do_update, bool *overflow) {
++item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch, bool do_update, bool *overflow, 
++    atlas_unique_ptr **up) {
+     item *it;
+-    if (should_touch) {
+-        it = item_touch(key, nkey, exptime, c);
+-    } else {
+-        it = item_get(key, nkey, c, do_update);
+-    }
++    BARRIER_ASSERT(up && !should_touch && "Not supported");
++    it = item_get(key, nkey, c, do_update, up);
+     if (it && it->refcount > IT_REFCOUNT_LIMIT) {
+         item_remove(it);
+         it = NULL;
+@@ -2241,7 +2256,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
+     int res;
+     item *it;
+ 
+-    it = do_item_get(key, nkey, hv, c, DONT_UPDATE);
++    it = do_item_get(key, nkey, hv, c, DONT_UPDATE, NULL);
+     if (!it) {
+         return DELTA_ITEM_NOT_FOUND;
+     }
+@@ -2317,7 +2332,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
+         }
+         memcpy(ITEM_data(new_it), buf, res);
+         memcpy(ITEM_data(new_it) + res, "\r\n", 2);
+-        item_replace(it, new_it, hv);
++        item_replace(it, new_it, hv, NULL);
+         // Overwrite the older item's CAS with our new CAS since we're
+         // returning the CAS of the old item below.
+         ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);
+@@ -3175,8 +3190,10 @@ static void drive_machine(conn *c) {
+             break;
+ 
+         case conn_nread:
++            fprintf(stderr, "conn nread before\n");
+             if (c->rlbytes == 0) {
+                 complete_nread(c);
++                fprintf(stderr, "conn nread end\n");
+                 break;
+             }
+ 
+@@ -4760,6 +4777,7 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
+ }
+ 
+ int main (int argc, char **argv) {
++    atlas_init();
+     int c;
+     bool lock_memory = false;
+     bool do_daemonize = false;
+diff --git a/memcached.h b/memcached.h
+index 5f517f2..7cca88c 100644
+--- a/memcached.h
++++ b/memcached.h
+@@ -1,4 +1,5 @@
+ /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
++#pragma once
+ 
+ /** \file
+  * The main memcached header holding commonly used data
+@@ -919,7 +920,8 @@ enum delta_result_type do_add_delta(conn *c, const char *key,
+                                     const int64_t delta, char *buf,
+                                     uint64_t *cas, const uint32_t hv,
+                                     item **it_ret);
+-enum store_item_type do_store_item(item *item, int comm, conn* c, const uint32_t hv);
++struct atlas_unique_ptr;
++enum store_item_type do_store_item(item *item, int comm, conn* c, const uint32_t hv, struct atlas_unique_ptr**item_up);
+ void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack_cb cb, io_queue_stack_cb com_cb, io_queue_cb ret_cb, io_queue_cb fin_cb);
+ void conn_io_queue_setup(conn *c);
+ io_queue_t *conn_io_queue_get(conn *c, int type);
+@@ -971,12 +973,12 @@ void  conn_close_all(void);
+ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
+ #define DO_UPDATE true
+ #define DONT_UPDATE false
+-item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update);
++item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update, struct atlas_unique_ptr**up);
+ item *item_get_locked(const char *key, const size_t nkey, conn *c, const bool do_update, uint32_t *hv);
+ item *item_touch(const char *key, const size_t nkey, uint32_t exptime, conn *c);
+ int   item_link(item *it);
+ void  item_remove(item *it);
+-int   item_replace(item *it, item *new_it, const uint32_t hv);
++int   item_replace(item *it, item *new_it, const uint32_t hv, struct atlas_unique_ptr **new_it_up);
+ void  item_unlink(item *it);
+ 
+ void item_lock(uint32_t hv);
+@@ -1001,7 +1003,7 @@ LIBEVENT_THREAD *get_worker_thread(int id);
+ void append_stat(const char *name, ADD_STAT add_stats, conn *c,
+                  const char *fmt, ...);
+ 
+-enum store_item_type store_item(item *item, int comm, conn *c);
++enum store_item_type store_item(item *item, int comm, conn *c, struct atlas_unique_ptr **item_up);
+ 
+ /* Protocol related code */
+ void out_string(conn *c, const char *str);
+@@ -1012,7 +1014,7 @@ void out_string(conn *c, const char *str);
+ #define EXPTIME_TO_POSITIVE_TIME(exptime) (exptime < 0) ? \
+         REALTIME_MAXDELTA + 1 : exptime
+ rel_time_t realtime(const time_t exptime);
+-item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch, bool do_update, bool *overflow);
++item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch, bool do_update, bool *overflow, struct atlas_unique_ptr **up);
+ item* limited_get_locked(char *key, size_t nkey, conn *c, bool do_update, uint32_t *hv, bool *overflow);
+ // Read/Response object handlers.
+ void resp_reset(mc_resp *resp);
+diff --git a/proto_bin.c b/proto_bin.c
+index d8b37c5..748369c 100644
+--- a/proto_bin.c
++++ b/proto_bin.c
+@@ -12,6 +12,7 @@
+ #endif
+ #include <string.h>
+ #include <stdlib.h>
++#include "atlas.h"
+ 
+ /** binprot handlers **/
+ static void process_bin_flush(conn *c, char *extbuf);
+@@ -29,6 +30,7 @@ static void process_bin_complete_sasl_auth(conn *c);
+ static void write_bin_miss_response(conn *c, char *key, size_t nkey);
+ 
+ void complete_nread_binary(conn *c) {
++    BARRIER_ASSERT(false && "NOT IMPLEMENTED");
+     assert(c != NULL);
+     assert(c->cmd >= 0);
+ 
+@@ -325,8 +327,9 @@ static void complete_incr_bin(conn *c, char *extbuf) {
+             if (it != NULL) {
+                 memcpy(ITEM_data(it), tmpbuf, res);
+                 memcpy(ITEM_data(it) + res, "\r\n", 2);
+-
+-                if (store_item(it, NREAD_ADD, c)) {
++                atlas_unique_ptr *up;
++                BARRIER_ASSERT(false && "Not implemented\n");
++                if (store_item(it, NREAD_ADD, c, &up)) {
+                     c->cas = ITEM_get_cas(it);
+                     write_bin_response(c, &rsp->message.body, 0, 0, sizeof(rsp->message.body.value));
+                 } else {
+@@ -382,7 +385,9 @@ static void complete_update_bin(conn *c) {
+         ch->used += 2;
+     }
+ 
+-    ret = store_item(it, c->cmd, c);
++    atlas_unique_ptr *up;
++    BARRIER_ASSERT(false && "Not implemented\n");
++    ret = store_item(it, c->cmd, c, &up);
+ 
+ #ifdef ENABLE_DTRACE
+     uint64_t cas = ITEM_get_cas(it);
+@@ -478,7 +483,7 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
+ 
+         it = item_touch(key, nkey, realtime(exptime), c);
+     } else {
+-        it = item_get(key, nkey, c, DO_UPDATE);
++        it = item_get(key, nkey, c, DO_UPDATE, NULL);
+     }
+ 
+     if (it) {
+@@ -1136,7 +1141,7 @@ static void process_bin_update(conn *c, char *extbuf) {
+         /* Avoid stale data persisting in cache because we failed alloc.
+          * Unacceptable for SET. Anywhere else too? */
+         if (c->cmd == PROTOCOL_BINARY_CMD_SET) {
+-            it = item_get(key, nkey, c, DONT_UPDATE);
++            it = item_get(key, nkey, c, DONT_UPDATE, NULL);
+             if (it) {
+                 item_unlink(it);
+                 STORAGE_delete(c->thread->storage, it);
+diff --git a/proto_text.c b/proto_text.c
+index 6885786..87f042a 100644
+--- a/proto_text.c
++++ b/proto_text.c
+@@ -17,6 +17,7 @@
+ #endif
+ #include <string.h>
+ #include <stdlib.h>
++#include "atlas.h"
+ 
+ #define META_SPACE(p) { \
+     *p = ' '; \
+@@ -129,6 +130,7 @@ void complete_nread_ascii(conn *c) {
+     assert(c != NULL);
+ 
+     item *it = c->item;
++    atlas_unique_ptr *it_up = NULL;
+     int comm = c->cmd;
+     enum store_item_type ret;
+     bool is_valid = false;
+@@ -172,7 +174,14 @@ void complete_nread_ascii(conn *c) {
+         }
+         out_string(c, "CLIENT_ERROR bad data chunk");
+     } else {
+-      ret = store_item(it, comm, c);
++      fprintf(stderr, "store item before \n");
++      /* [Atlas] the unique_ptr will be NULL if the store does not succeed */
++      ret = store_item(it, comm, c, &it_up);
++      if(it_up){
++        fprintf(stderr, "store item success: up 0x%lx, it %p, up inner ptr 0x%lx\n", it_up->handle, (void*)it, it_up->handle >> 47);
++      }else{
++        fprintf(stderr, "store item fail, it_up is NULL\n");
++      }
+ 
+ #ifdef ENABLE_DTRACE
+       uint64_t cas = ITEM_get_cas(it);
+@@ -230,6 +239,7 @@ void complete_nread_ascii(conn *c) {
+     c->set_stale = false; /* force flag to be off just in case */
+     c->mset_res = false;
+     item_remove(c->item);       /* release the c->item reference */
++    atlas_put_item(it_up, c->item);
+     c->item = 0;
+ }
+ 
+@@ -568,8 +578,8 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
+                 fail_length = true;
+                 goto stop;
+             }
+-
+-            it = limited_get(key, nkey, c, exptime, should_touch, DO_UPDATE, &overflow);
++            atlas_unique_ptr *up = NULL;
++            it = limited_get(key, nkey, c, exptime, should_touch, DO_UPDATE, &overflow, &up);
+             if (settings.detail_enabled) {
+                 stats_prefix_record_get(key, nkey, NULL != it);
+             }
+@@ -641,11 +651,12 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
+ #ifdef EXTSTORE
+                 /* If ITEM_HDR, an io_wrap owns the reference. */
+                 if ((it->it_flags & ITEM_HDR) == 0) {
+-                    resp->item = it;
++                    resp->item = NULL;
+                 }
+ #else
+-                resp->item = it;
++                resp->item = NULL;
+ #endif
++                atlas_put_item(up, it);
+             } else {
+                 pthread_mutex_lock(&c->thread->stats.mutex);
+                 if (should_touch) {
+@@ -848,7 +859,7 @@ static void process_meta_command(conn *c, token_t *tokens, const size_t ntokens)
+     }
+ 
+     bool overflow; // not used here.
+-    item *it = limited_get(key, nkey, c, 0, false, DONT_UPDATE, &overflow);
++    item *it = limited_get(key, nkey, c, 0, false, DONT_UPDATE, &overflow, NULL);
+     if (it) {
+         mc_resp *resp = c->resp;
+         size_t total = 0;
+@@ -1101,7 +1112,7 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
+     // I think we do, since an overflow shouldn't trigger an alloc/replace.
+     bool overflow = false;
+     if (!of.locked) {
+-        it = limited_get(key, nkey, c, 0, false, !of.no_update, &overflow);
++        it = limited_get(key, nkey, c, 0, false, !of.no_update, &overflow, NULL);
+     } else {
+         // If we had to lock the item, we're doing our own bump later.
+         it = limited_get_locked(key, nkey, c, DONT_UPDATE, &hv, &overflow);
+@@ -1128,7 +1139,7 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
+             // I look forward to the day I get rid of this :)
+             memcpy(ITEM_data(it), "\r\n", 2);
+             // NOTE: This initializes the CAS value.
+-            do_item_link(it, hv);
++            do_item_link(it, hv, NULL);
+             item_created = true;
+         }
+     }
+@@ -1781,7 +1792,9 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
+             if (it != NULL) {
+                 memcpy(ITEM_data(it), tmpbuf, vlen);
+                 memcpy(ITEM_data(it) + vlen, "\r\n", 2);
+-                if (do_store_item(it, NREAD_ADD, c, hv)) {
++                BARRIER_ASSERT(false && "Not implemented");
++                atlas_unique_ptr *up;
++                if (do_store_item(it, NREAD_ADD, c, hv, &up)) {
+                     item_created = true;
+                 } else {
+                     // Not sure how we can get here if we're holding the lock.
+@@ -1990,7 +2003,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
+         /* Avoid stale data persisting in cache because we failed alloc.
+          * Unacceptable for SET. Anywhere else too? */
+         if (comm == NREAD_SET) {
+-            it = item_get(key, nkey, c, DONT_UPDATE);
++            it = item_get(key, nkey, c, DONT_UPDATE, NULL);
+             if (it) {
+                 item_unlink(it);
+                 STORAGE_delete(c->thread->storage, it);
+@@ -2793,7 +2806,7 @@ void process_command_ascii(conn *c, char *command) {
+         }
+     } else if (first == 's') {
+         if (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) {
+-
++            fprintf(stderr, "set command\n");
+             WANT_TOKENS_OR(ntokens, 6, 7);
+             process_update_command(c, tokens, ntokens, comm, false);
+         } else if (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0) {
+@@ -2811,7 +2824,7 @@ void process_command_ascii(conn *c, char *command) {
+     } else if (first == 'a') {
+         if ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
+             (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) ) {
+-
++            fprintf(stderr, "add command\n");
+             WANT_TOKENS_OR(ntokens, 6, 7);
+             process_update_command(c, tokens, ntokens, comm, false);
+         } else {
+diff --git a/slabs.c b/slabs.c
+index 3c78d8a..454cc5a 100644
+--- a/slabs.c
++++ b/slabs.c
+@@ -1004,7 +1004,7 @@ static int slab_rebalance_move(void) {
+                         /* These are definitely required. else fails assert */
+                         new_it->it_flags &= ~ITEM_LINKED;
+                         new_it->refcount = 0;
+-                        do_item_replace(it, new_it, hv);
++                        do_item_replace(it, new_it, hv, NULL);
+                         /* Need to walk the chunks and repoint head  */
+                         if (new_it->it_flags & ITEM_CHUNKED) {
+                             item_chunk *fch = (item_chunk *) ITEM_schunk(new_it);
+diff --git a/storage.c b/storage.c
+index f82d96b..d1a175c 100644
+--- a/storage.c
++++ b/storage.c
+@@ -426,7 +426,7 @@ static void recache_or_free(io_pending_t *pending) {
+                 it->refcount = 0;
+                 it->h_next = NULL; // might not be necessary.
+                 STORAGE_delete(c->thread->storage, h_it);
+-                item_replace(h_it, it, hv);
++                item_replace(h_it, it, hv, NULL);
+                 pthread_mutex_lock(&c->thread->stats.mutex);
+                 c->thread->stats.recache_from_extstore++;
+                 pthread_mutex_unlock(&c->thread->stats.mutex);
+@@ -553,7 +553,7 @@ static int storage_write(void *storage, const int clsid, const int item_age) {
+                  * header and replace. Most of this requires the item lock
+                  */
+                 /* CAS gets set while linking. Copy post-replace */
+-                item_replace(it, hdr_it, it_info.hv);
++                item_replace(it, hdr_it, it_info.hv, NULL);
+                 ITEM_set_cas(hdr_it, ITEM_get_cas(it));
+                 do_item_remove(hdr_it);
+                 did_moves = 1;
+diff --git a/thread.c b/thread.c
+index d5ed052..c837dad 100644
+--- a/thread.c
++++ b/thread.c
+@@ -18,6 +18,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <pthread.h>
++#include "atlas.h"
+ 
+ #include "queue.h"
+ 
+@@ -807,12 +808,13 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
+  * Returns an item if it hasn't been marked as expired,
+  * lazy-expiring as needed.
+  */
+-item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update) {
++item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update, atlas_unique_ptr** up) {
++    BARRIER_ASSERT(up && "Not supported");
+     item *it;
+     uint32_t hv;
+     hv = hash(key, nkey);
+     item_lock(hv);
+-    it = do_item_get(key, nkey, hv, c, do_update);
++    it = do_item_get(key, nkey, hv, c, do_update, up);
+     item_unlock(hv);
+     return it;
+ }
+@@ -824,7 +826,7 @@ item *item_get_locked(const char *key, const size_t nkey, conn *c, const bool do
+     item *it;
+     *hv = hash(key, nkey);
+     item_lock(*hv);
+-    it = do_item_get(key, nkey, *hv, c, do_update);
++    it = do_item_get(key, nkey, *hv, c, do_update, NULL);
+     return it;
+ }
+ 
+@@ -847,7 +849,7 @@ int item_link(item *item) {
+ 
+     hv = hash(ITEM_key(item), item->nkey);
+     item_lock(hv);
+-    ret = do_item_link(item, hv);
++    ret = do_item_link(item, hv, NULL);
+     item_unlock(hv);
+     return ret;
+ }
+@@ -870,8 +872,8 @@ void item_remove(item *item) {
+  * Unprotected by a mutex lock since the core server does not require
+  * it to be thread-safe.
+  */
+-int item_replace(item *old_it, item *new_it, const uint32_t hv) {
+-    return do_item_replace(old_it, new_it, hv);
++int item_replace(item *old_it, item *new_it, const uint32_t hv, atlas_unique_ptr **new_it_up) {
++    return do_item_replace(old_it, new_it, hv, new_it_up);
+ }
+ 
+ /*
+@@ -905,13 +907,13 @@ enum delta_result_type add_delta(conn *c, const char *key,
+ /*
+  * Stores an item in the cache (high level, obeys set/add/replace semantics)
+  */
+-enum store_item_type store_item(item *item, int comm, conn* c) {
++enum store_item_type store_item(item *item, int comm, conn* c, atlas_unique_ptr ** item_up) {
+     enum store_item_type ret;
+     uint32_t hv;
+ 
+     hv = hash(ITEM_key(item), item->nkey);
+     item_lock(hv);
+-    ret = do_store_item(item, comm, c, hv);
++    ret = do_store_item(item, comm, c, hv, item_up);
+     item_unlock(hv);
+     return ret;
+ }
+-- 
+2.25.1
+
