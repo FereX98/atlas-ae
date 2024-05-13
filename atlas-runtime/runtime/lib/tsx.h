@@ -1,18 +1,14 @@
 #pragma once
 #include <immintrin.h>
 #include <stdint.h>
-/* Use TSX inst to check if an object is in remote.
- * Here `-O1` is necessary to make sure the memory access happens */
-#pragma GCC push_options
-#pragma GCC optimize("O1")
-static bool __attribute__((noinline)) tsx_remote_check(const void *object) {
+static inline bool tsx_remote_check(const void *object) {
     bool is_local = false;
-    uint8_t word = 0;
     uint32_t status = 0;
+    uint8_t x;
 retry:
     status = _xbegin();
     if (status == _XBEGIN_STARTED) {
-        word = *(uint8_t *)object;
+        asm volatile("movb (%1), %0\n\t" : "=r"(x) : "r"(object) : "memory");
         _xend();
         is_local = true;
     } else if (status & _XABORT_RETRY) {
@@ -20,6 +16,5 @@ retry:
     } else if (status & _XABORT_CONFLICT) {
         is_local = true;
     }
-    return !is_local && !word;
+    return !is_local;
 }
-#pragma GCC pop_options
