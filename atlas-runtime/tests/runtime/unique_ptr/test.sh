@@ -4,8 +4,6 @@ if [ -z "$test" ]; then
     exit 1
 fi
 
-# disable the psf manager
-sudo bash -c "echo N > /sys/kernel/debug/hermit/bks/fake_psf_manager"
 cgcreate -g memory:test
 cgset -r memory.limit_in_bytes=512M test
 
