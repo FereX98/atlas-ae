@@ -185,11 +185,11 @@ sudo update-alternatives --config gcc
 cmake ..
 make -j
 
-cd Paris/bks_module/remoteswap/server
+cd atlas-runtime/bks_module/remoteswap/server
 #./rswap-server <memory server ip> <memory server port> <memory pool size in GB> <number of cores on CPU server>
 ./rswap-server 172.16.16.1 9999 48 96
 
-cd Paris/bks_module/remoteswap/client
+cd atlas-runtime/bks_module/remoteswap/client
 ## edit accordingly
 bash manage_rswap_client.sh install
 
@@ -208,3 +208,9 @@ sudo chmod 777 /dev/${device_name}
 sudo bash -c "echo 0 > /proc/sys/kernel/randomize_va_space"
 echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost
 ```
+### Test Atlas runtime
+```bash
+cd atlas-runtime/build/tests/runtime/unique_ptr
+bash test.sh ./unique_ptr_test
+```
+
